@@ -561,4 +561,12 @@ async def download_document(
     if download_url:
         # Return redirect to signed URL
         from fastapi.responses import RedirectResponse
-        return RedirectResponse(url=
+        return RedirectResponse(url=download_url)
+    else:
+        # Stream file directly
+        from fastapi.responses import FileResponse
+        return FileResponse(
+            path=file_path,
+            filename=document.name,
+            media_type=document.mime_type
+        )
