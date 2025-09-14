@@ -188,4 +188,18 @@ class SecurityHeadersMiddleware:
                         b"X-Frame-Options": b"DENY",
                         b"X-XSS-Protection": b"1; mode=block",
                         b"Strict-Transport-Security": b"max-age=31536000; includeSubDomains",
-                        b"
+                        b"Referrer-Policy": b"strict-origin-when-cross-origin",
+                        b"Content-Security-Policy": b"default-src 'self'; img-src 'self' data: https:; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"
+                    }
+                    
+                    # Update headers
+                    for key, value in security_headers.items():
+                        headers[key] = value
+                    
+                    message["headers"] = list(headers.items())
+                
+                await send(message)
+            
+            await self.app(scope, receive, send_wrapper)
+        else:
+            await self.app(scope, receive, send)
