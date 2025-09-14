@@ -1,0 +1,456 @@
+from fastapi import APIRouter, Depends, HTTPException, status, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, and_
+from typing import List, Optional
+import structlog
+import uuid
+
+from database import get_db
+from models import User, Company
+from schemas import (
+    User as UserSchema, UserCreate, UserUpdate, UserChangePassword,
+    PaginatedResponse, APIResponse
+)
+from auth import (
+    get_current_user_with_company, require_admin, get_password_hash,
+    verify_password, validate_password_strength
+)
+
+logger = structlog.get_logger()
+router = APIRouter()
+
+@router.get("/", response_model=PaginatedResponse)
+async def list_users(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, ge=1, le=100),
+    search: Optional[str] = None,
+    current_user_company: tuple[User, Company] = Depends(get_current_user_with_company),
+    db: AsyncSession = Depends(get_db)
+):
+    """List company users (admin only)"""
+    
+    current_user, company = current_user_company
+    
+    # Only admins can list users
+    if current_user.role != "ADMIN":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admins can list users"
+        )
+    
+    # Build query
+    query = select(User).where(User.company_id == company.id)
+    
+    # Apply search filter
+    if search:
+        query = query.where(
+            User.first_name.ilike(f"%{search}%") | 
+            User.last_name.ilike(f"%{search}%") |
+            User.email.ilike(f"%{search}%")
+        )
+    
+    # Count total items
+    count_result = await db.execute(
+        select(User).where(User.company_id == company.id)
+    )
+    total = len(count_result.fetchall())
+    
+    # Apply pagination and ordering
+    query = query.order_by(User.first_name, User.last_name)
+    query = query.offset((page - 1) * per_page).limit(per_page)
+    
+    # Execute query
+    result = await db.execute(query)
+    users = result.scalars().all()
+    
+    # Calculate pagination info
+    pages = (total + per_page - 1) // per_page
+    
+    return PaginatedResponse(
+        items=[UserSchema.model_validate(user) for user in users],
+        total=total,
+        page=page,
+        per_page=per_page,
+        pages=pages,
+        has_next=page < pages,
+        has_prev=page > 1
+    )
+
+@router.post("/", response_model=UserSchema)
+async def create_user(
+    user_data: UserCreate,
+    admin_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Create a new user (admin only)"""
+    
+    try:
+        # Check if email already exists
+        result = await db.execute(
+            select(User).where(User.email == user_data.email.lower())
+        )
+        existing_user = result.scalar_one_or_none()
+        
+        if existing_user:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email already registered"
+            )
+        
+        # Validate password strength
+        is_strong, errors = validate_password_strength(user_data.password)
+        if not is_strong:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Password requirements not met: {'; '.join(errors)}"
+            )
+        
+        # Create user
+        hashed_password = get_password_hash(user_data.password)
+        user = User(
+            email=user_data.email.lower(),
+            password_hash=hashed_password,
+            first_name=user_data.first_name,
+            last_name=user_data.last_name,
+            role=user_data.role,
+            company_id=user_data.company_id or admin_user.company_id,
+            is_active=True,
+            email_verified=True  # Admin-created users are auto-verified
+        )
+        
+        db.add(user)
+        await db.commit()
+        await db.refresh(user)
+        
+        logger.info(
+            "User created by admin",
+            new_user_id=str(user.id),
+            admin_id=str(admin_user.id),
+            email=user.email
+        )
+        
+        return UserSchema.model_validate(user)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        logger.error("User creation error", error=str(e), email=user_data.email)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create user"
+        )
+
+@router.get("/{user_id}", response_model=UserSchema)
+async def get_user(
+    user_id: uuid.UUID,
+    current_user_company: tuple[User, Company] = Depends(get_current_user_with_company),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get user by ID"""
+    
+    current_user, company = current_user_company
+    
+    # Users can only get their own info, or admins can get any user in their company
+    if current_user.id != user_id and current_user.role != "ADMIN":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied"
+        )
+    
+    # Get user
+    query = select(User).where(User.id == user_id)
+    
+    # If not admin, ensure user belongs to same company
+    if current_user.role != "ADMIN":
+        query = query.where(User.company_id == company.id)
+    
+    result = await db.execute(query)
+    user = result.scalar_one_or_none()
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    # If admin is looking at user from different company, check permission
+    if current_user.role == "ADMIN" and user.company_id != company.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cannot access user from different company"
+        )
+    
+    return UserSchema.model_validate(user)
+
+@router.put("/{user_id}", response_model=UserSchema)
+async def update_user(
+    user_id: uuid.UUID,
+    user_update: UserUpdate,
+    current_user_company: tuple[User, Company] = Depends(get_current_user_with_company),
+    db: AsyncSession = Depends(get_db)
+):
+    """Update user"""
+    
+    current_user, company = current_user_company
+    
+    # Users can only update their own info, or admins can update any user in their company
+    if current_user.id != user_id and current_user.role != "ADMIN":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied"
+        )
+    
+    # Get user
+    result = await db.execute(
+        select(User).where(
+            and_(
+                User.id == user_id,
+                User.company_id == company.id
+            )
+        )
+    )
+    user = result.scalar_one_or_none()
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    try:
+        # Update fields
+        update_data = user_update.model_dump(exclude_unset=True)
+        
+        # Only admins can change role and is_active
+        if current_user.role != "ADMIN":
+            update_data.pop("role", None)
+            update_data.pop("is_active", None)
+        
+        # Don't allow users to deactivate themselves
+        if current_user.id == user_id and "is_active" in update_data:
+            if not update_data["is_active"]:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Cannot deactivate your own account"
+                )
+        
+        # Don't allow the last admin to remove their admin role
+        if "role" in update_data and user.role == "ADMIN" and update_data["role"] != "ADMIN":
+            # Check if this is the last admin
+            result = await db.execute(
+                select(User).where(
+                    and_(
+                        User.company_id == company.id,
+                        User.role == "ADMIN",
+                        User.is_active == True,
+                        User.id != user_id
+                    )
+                )
+            )
+            other_admins = result.scalars().all()
+            
+            if not other_admins:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Cannot remove admin role from the last admin"
+                )
+        
+        for field, value in update_data.items():
+            setattr(user, field, value)
+        
+        await db.commit()
+        await db.refresh(user)
+        
+        logger.info("User updated", user_id=str(user_id), updated_by=str(current_user.id))
+        
+        return UserSchema.model_validate(user)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        logger.error("User update error", error=str(e), user_id=str(user_id))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update user"
+        )
+
+@router.post("/{user_id}/change-password", response_model=APIResponse)
+async def change_user_password(
+    user_id: uuid.UUID,
+    password_data: UserChangePassword,
+    current_user_company: tuple[User, Company] = Depends(get_current_user_with_company),
+    db: AsyncSession = Depends(get_db)
+):
+    """Change user password"""
+    
+    current_user, company = current_user_company
+    
+    # Users can only change their own password
+    if current_user.id != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Can only change your own password"
+        )
+    
+    # Verify old password
+    if not verify_password(password_data.old_password, current_user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Incorrect old password"
+        )
+    
+    # Validate new password strength
+    is_strong, errors = validate_password_strength(password_data.new_password)
+    if not is_strong:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Password requirements not met: {'; '.join(errors)}"
+        )
+    
+    try:
+        # Update password
+        current_user.password_hash = get_password_hash(password_data.new_password)
+        await db.commit()
+        
+        logger.info("Password changed", user_id=str(user_id))
+        
+        return APIResponse(
+            success=True,
+            message="Password changed successfully"
+        )
+        
+    except Exception as e:
+        await db.rollback()
+        logger.error("Password change error", error=str(e), user_id=str(user_id))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to change password"
+        )
+
+@router.post("/{user_id}/reset-password", response_model=APIResponse)
+async def admin_reset_password(
+    user_id: uuid.UUID,
+    new_password: str,
+    admin_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Reset user password (admin only)"""
+    
+    # Get user
+    result = await db.execute(
+        select(User).where(
+            and_(
+                User.id == user_id,
+                User.company_id == admin_user.company_id
+            )
+        )
+    )
+    user = result.scalar_one_or_none()
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    # Validate new password strength
+    is_strong, errors = validate_password_strength(new_password)
+    if not is_strong:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Password requirements not met: {'; '.join(errors)}"
+        )
+    
+    try:
+        # Update password
+        user.password_hash = get_password_hash(new_password)
+        await db.commit()
+        
+        logger.info("Password reset by admin", user_id=str(user_id), admin_id=str(admin_user.id))
+        
+        return APIResponse(
+            success=True,
+            message="Password reset successfully"
+        )
+        
+    except Exception as e:
+        await db.rollback()
+        logger.error("Password reset error", error=str(e), user_id=str(user_id))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to reset password"
+        )
+
+@router.delete("/{user_id}", response_model=APIResponse)
+async def delete_user(
+    user_id: uuid.UUID,
+    admin_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db)
+):
+    """Delete user (admin only)"""
+    
+    # Get user
+    result = await db.execute(
+        select(User).where(
+            and_(
+                User.id == user_id,
+                User.company_id == admin_user.company_id
+            )
+        )
+    )
+    user = result.scalar_one_or_none()
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    # Prevent admin from deleting themselves
+    if user.id == admin_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot delete your own account"
+        )
+    
+    # Prevent deleting the last admin
+    if user.role == "ADMIN":
+        result = await db.execute(
+            select(User).where(
+                and_(
+                    User.company_id == admin_user.company_id,
+                    User.role == "ADMIN",
+                    User.is_active == True,
+                    User.id != user_id
+                )
+            )
+        )
+        other_admins = result.scalars().all()
+        
+        if not other_admins:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot delete the last admin"
+            )
+    
+    try:
+        # Soft delete by deactivating the user
+        user.is_active = False
+        await db.commit()
+        
+        logger.info("User deactivated", user_id=str(user_id), admin_id=str(admin_user.id))
+        
+        return APIResponse(
+            success=True,
+            message="User deactivated successfully"
+        )
+        
+    except Exception as e:
+        await db.rollback()
+        logger.error("User deletion error", error=str(e), user_id=str(user_id))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete user"
+        )
