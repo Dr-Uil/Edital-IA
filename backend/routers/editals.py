@@ -448,4 +448,134 @@ async def process_edital_analysis(
             await db.commit()
             
             # Extract text from PDF
-            text_content = await DocumentProcessor.extract_text_from
+            text_content = await DocumentProcessor.extract_text_from_pdf(file_path)
+            
+            if not text_content.strip():
+                # Try OCR if no text extracted
+                text_content = await DocumentProcessor.extract_text_with_ocr(file_path)
+            
+            if not text_content.strip():
+                raise Exception("Could not extract text from PDF")
+            
+            # Call ML service for analysis
+            ml_request = MLAnalysisRequest(
+                edital_id=edital_id,
+                file_path=file_path,
+                text_content=text_content
+            )
+            
+            ml_response = await call_ml_service(ml_request)
+            
+            if not ml_response.success:
+                raise Exception(f"ML analysis failed: {ml_response.error}")
+            
+            # Save analysis results
+            await save_analysis_results(db, edital_id, ml_response)
+            
+            # Update status to completed
+            edital.analysis_status = AnalysisStatus.COMPLETED
+            await db.commit()
+            
+            # Send completion email
+            await send_analysis_complete_email(
+                user_email,
+                user_name,
+                edital.original_filename,
+                str(edital.id)
+            )
+            
+            logger.info("Edital analysis completed successfully", edital_id=str(edital_id))
+            
+        except Exception as e:
+            # Update status to failed
+            edital.analysis_status = AnalysisStatus.FAILED
+            edital.error_message = str(e)
+            await db.commit()
+            
+            logger.error("Edital analysis failed", error=str(e), edital_id=str(edital_id))
+
+async def call_ml_service(request: MLAnalysisRequest) -> MLAnalysisResponse:
+    """Call the ML service for edital analysis"""
+    
+    try:
+        async with httpx.AsyncClient(timeout=300.0) as client:  # 5 minute timeout
+            response = await client.post(
+                f"{settings.ML_SERVICE_URL}/analyze",
+                json=request.model_dump()
+            )
+            response.raise_for_status()
+            
+            return MLAnalysisResponse(**response.json())
+            
+    except httpx.RequestError as e:
+        logger.error("ML service request error", error=str(e))
+        return MLAnalysisResponse(
+            success=False,
+            error=f"Failed to connect to ML service: {str(e)}"
+        )
+    except httpx.HTTPStatusError as e:
+        logger.error("ML service HTTP error", status_code=e.response.status_code)
+        return MLAnalysisResponse(
+            success=False,
+            error=f"ML service error: {e.response.status_code}"
+        )
+    except Exception as e:
+        logger.error("ML service unexpected error", error=str(e))
+        return MLAnalysisResponse(
+            success=False,
+            error=f"Unexpected error: {str(e)}"
+        )
+
+async def save_analysis_results(db: AsyncSession, edital_id: uuid.UUID, ml_response: MLAnalysisResponse):
+    """Save ML analysis results to database"""
+    
+    try:
+        # Delete existing analysis data
+        await db.execute(select(EditalAnalysis).where(EditalAnalysis.edital_id == edital_id))
+        await db.execute(select(ExtractedEntity).where(ExtractedEntity.edital_id == edital_id))
+        await db.execute(select(HabilitacaoRequirement).where(HabilitacaoRequirement.edital_id == edital_id))
+        
+        # Save analysis
+        if ml_response.analysis:
+            analysis = EditalAnalysis(
+                edital_id=edital_id,
+                organizacao_licitante=ml_response.analysis.organizacao_licitante,
+                modalidade_licitacao=ml_response.analysis.modalidade_licitacao,
+                numero_processo=ml_response.analysis.numero_processo,
+                data_abertura_propostas=ml_response.analysis.data_abertura_propostas,
+                data_sessao_publica=ml_response.analysis.data_sessao_publica,
+                objeto_licitacao=ml_response.analysis.objeto_licitacao,
+                criterio_julgamento=ml_response.analysis.criterio_julgamento,
+                valor_estimado=ml_response.analysis.valor_estimado
+            )
+            db.add(analysis)
+        
+        # Save entities
+        for entity_data in ml_response.entities:
+            entity = ExtractedEntity(
+                edital_id=edital_id,
+                entity_type=entity_data.entity_type,
+                entity_value=entity_data.entity_value,
+                confidence=entity_data.confidence,
+                start_position=entity_data.start_position,
+                end_position=entity_data.end_position
+            )
+            db.add(entity)
+        
+        # Save requirements
+        for req_data in ml_response.requirements:
+            requirement = HabilitacaoRequirement(
+                edital_id=edital_id,
+                requirement_type=req_data.requirement_type,
+                description=req_data.description,
+                document_type=req_data.document_type,
+                is_mandatory=req_data.is_mandatory
+            )
+            db.add(requirement)
+        
+        await db.commit()
+        
+    except Exception as e:
+        await db.rollback()
+        logger.error("Failed to save analysis results", error=str(e), edital_id=str(edital_id))
+        raise
